@@ -1,7 +1,6 @@
 //! §6.1.0 Overview — Velvet Sigilbook (Rust)
 //! Layout:  [MAGIC="SIGL"(4) | VER(1) | SALT_LEN(1) | SALT[..]] | TAG(32) | CIPHERTEXT[..]
 //! KDF:     scrypt N=2^14, r=8, p=1 → 32B seed
-//! Stream:  XOR with SHA-256(seed || counter_le)
 //! MAC:     BLAKE3 keyed with seed over: "SIGILBOOK-MAC-v1" || header || len_le || ciphertext
 //! Notes:   - "save" accepts "-" to read password from stdin (keeps secrets out of argv)
 //!          - holding DB syncs to USB automatically when key is present
