@@ -63,10 +63,11 @@ fn random_unicode_password(min_cps: usize, max_cps: usize) -> String {
 }
 
 /* §2.3.4 xor_bytes_into: XOR a^b into dst */
+// Replace the old helper:
 #[inline]
-fn xor_bytes_into(dst: &mut [u8], a: &[u8], b: &[u8]) {
-    for i in 0..a.len() {
-        dst[i] = a[i] ^ b[i];
+fn xor_inplace(dst: &mut [u8], ks: &[u8]) {
+    for i in 0..dst.len() {
+        dst[i] ^= ks[i];
     }
 }
 
@@ -158,13 +159,6 @@ fn main() -> Result<()> {
     /* §2.4.8 config from RAW password (timestamp-bound) */
     let cfg = generate_config_with_timestamp(&password, None, 0, timestamp_ns)?;
 
-    /* §2.4.9 postmix = "SARX2DU-POST\0\0\0\0" || k_stream || nonce || ts_be */
-    let mut postmix = Vec::with_capacity(16 + k_stream_len + 12 + 8);
-    postmix.extend_from_slice(b"SARX2DU-POST\0\0\0\0");
-    postmix.extend_from_slice(k_stream);
-    postmix.extend_from_slice(&nonce12);
-    postmix.extend_from_slice(&u64_be(timestamp_ns));
-
     /* §2.4.10 header (61 bytes) */
     let header = VaultHeader {
         salt32,
@@ -184,47 +178,45 @@ fn main() -> Result<()> {
     let tag_pos = fout.stream_position()?;
     fout.write_all(&[0u8; SARX_TAG_BYTES])?;
 
-    /* §2.4.12 init MAC domain over header + len_le */
+    // §2.4.12 Init MAC domain over header + len_le.
     let mut mac = blake3::Hasher::new_keyed(&k_mac32);
-    mac.update(b"SARX2DU-MAC-v1");
+    mac.update(b"SARX-MAC-v1");
     mac.update(&header_raw);
     mac.update(&(size as u64).to_le_bytes());
 
-    /* §2.4.13 streaming + parallel XOR (rayon), generate_stream per-slice */
+    // §2.4.13 Streaming + parallel XOR (rayon), keystream per tile.
+    // Use one buffer and encrypt in place to avoid an extra copy.
     let chunk = 16 * 1024 * 1024;
-    let mut pt = vec![0u8; chunk];
-    let mut ct = vec![0u8; chunk];
+    let mut buf = vec![0u8; chunk];
     let mut abs_off: u64 = 0;
 
     loop {
-        let n = fin.read(&mut pt)?;
+        let n = fin.read(&mut buf)?;
         if n == 0 { break; }
 
-        let slice = (8 * 1024 * 1024).min(n.max(1));
+        // ~2 MiB tiles usually land best on desktop CPUs
+        let tile = (2 * 1024 * 1024).min(n.max(1));
 
-        ct[..n].par_chunks_mut(slice)
-            .zip(pt[..n].par_chunks(slice))
+        buf[..n]
+            .par_chunks_mut(tile)
             .enumerate()
-            .try_for_each(|(i, (dst, src))| -> Result<()> {
-                let start = abs_off + (i * slice) as u64;
+            .try_for_each(|(i, dst)| -> Result<()> {
+                let start = abs_off + (i * tile) as u64;
 
-                // per-thread keystream buffer (reuse; no alloc churn)
                 TLS_KS.with(|cell| -> Result<()> {
                     let mut ks = cell.borrow_mut();
-                    if ks.len() < src.len() { ks.resize(src.len(), 0); }
+                    if ks.len() < dst.len() { ks.resize(dst.len(), 0); }
 
-                    generate_stream(&cfg, Some(&postmix), start, src.len(), &mut ks[..src.len()])?;
-
-                    xor_bytes_into(dst, src, &ks[..src.len()]);
-
-                    use zeroize::Zeroize;
-                    ks[..src.len()].zeroize();
+                    // Postmix is disabled; pass None.
+                    generate_stream(&cfg, None, start, dst.len(), &mut ks[..dst.len()])?;
+                    xor_inplace(dst, &ks[..dst.len()]);
+                    ks[..dst.len()].zeroize();
                     Ok(())
                 })
             })?;
 
-        mac.update(&ct[..n]);
-        fout.write_all(&ct[..n])?;
+        mac.update(&buf[..n]);
+        fout.write_all(&buf[..n])?;
         abs_off += n as u64;
     }
 
